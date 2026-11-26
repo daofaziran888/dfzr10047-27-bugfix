@@ -38,10 +38,40 @@ class BaseModuleService:
             rows = [row for row in rows if row.get("status") == status]
         total = len(rows)
         start = (page - 1) * size
-        return rows[start:start + size], total
+        page_rows = rows[start:start + size]
+        return [self.decorate(row) for row in page_rows], total
+
+    def decorate(self, row: dict[str, Any]) -> dict[str, Any]:
+        """给每一行附带本行真正可执行的动作和资格说明，页面不再照搬全量动作。"""
+        allowed: list[str] = []
+        reasons: list[str] = []
+        for action in self.ACTION_RULES:
+            ok, reason = self.action_eligibility(row, action)
+            if ok:
+                allowed.append(action)
+            elif reason:
+                reasons.append(reason)
+        decorated = dict(row)
+        decorated["可执行动作"] = allowed
+        decorated["资格说明"] = "；".join(dict.fromkeys(reasons))
+        return decorated
+
+    def action_eligibility(self, row: dict[str, Any], action: str) -> tuple[bool, str]:
+        """默认动作资格：动作属于本模块即可执行，业务模块可覆盖收窄。"""
+        if action not in self.ACTION_RULES:
+            return False, f"动作「{action}」不属于{self.MODULE}可执行范围"
+        return True, ""
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
-        return store.find(self.MODULE, entry_id)
+        entry = store.find(self.MODULE, entry_id)
+        return self.decorate(entry) if entry is not None else None
+
+    def detail(self, entry_id: int) -> dict[str, Any] | None:
+        """比较详情/任务详情：返回条目本身与可核对的附加结论。"""
+        entry = self.get_entry(entry_id)
+        if entry is None:
+            return None
+        return {"entry": entry, "extra": {}}
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         missing = [
@@ -57,7 +87,7 @@ class BaseModuleService:
         entry["pending"] = True
         entry["abnormal"] = False
         rows.append(entry)
-        return entry, []
+        return self.decorate(entry), []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
@@ -66,10 +96,13 @@ class BaseModuleService:
         target = self.ACTION_RULES.get(action)
         if target is None:
             return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+        ok, reason = self.action_eligibility(entry, action)
+        if not ok:
+            return None, reason
         entry["status"] = target
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
-        return entry, f"{self.ENTITY}已{action}"
+        return self.decorate(entry), f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""

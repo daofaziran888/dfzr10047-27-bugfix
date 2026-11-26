@@ -28,6 +28,7 @@ from app.pipeline.structure_sniffer import StructureSniffer
 from app.pipeline.transform_stage import TransformStage
 from app.pipeline.template_version import TemplateVersionManager
 from app.pipeline.review_metric import ReviewMetricEngine
+from app.services import SERVICES
 from app.store import store
 
 
@@ -378,19 +379,42 @@ class ParsePipelineOrchestrator:
                 hit_versions[batch_id] = hit
         self._log(link, "version_hit", f"{hit_versions}")
 
-        affected = [b for b, v in hit_versions.items() if v == old_tmpl.template_id]
+        # 实际受影响的批次只来自真正命中旧版本的批次，零差异版本对的影响批次数为 0。
+        observed = [b for b, v in hit_versions.items() if v == old_tmpl.template_id]
         diff = self.templates.diff_versions(
-            old_tmpl.template_id, new_tmpl.template_id, len(affected))
+            old_tmpl.template_id, new_tmpl.template_id, len(observed))
+        diff_no = f"TD-{old_tmpl.version}-{new_tmpl.version}"
+        fields = diff.field_list() if diff else []
+        zero_diff = diff is None or diff.diff_field_count == 0
         _append_row("tmpl_diff", {
-            "差异编号": f"TD-{old_tmpl.version}-{new_tmpl.version}",
+            "差异编号": diff_no,
             "旧模板版本": old_tmpl.version, "新模板版本": new_tmpl.version,
-            "差异字段": ",".join(diff.field_list()) if diff else "",
+            "旧模板编号": old_tmpl.template_id, "新模板编号": new_tmpl.template_id,
+            "差异字段": ",".join(fields),
             "差异类别": (
                 f"新增{len(diff.added)},删除{len(diff.removed)},变更{len(diff.changed)}"
-                if diff else ""
+                if diff else "无差异"
             ),
-            "影响批次数": str(len(affected)),
-            "修正方案": "按位点范围重解析" if affected else "无需重解析",
+            "影响批次数": "0" if zero_diff else str(len(observed)),
+            "观察批次数": str(len(observed)),
+            "观察批次": ",".join(observed),
+            "命中批次": ",".join([] if zero_diff else observed),
+            "比较结论": (
+                f"模板 {old_tmpl.version}→{new_tmpl.version} 逐字段比对一致，零变化"
+                if zero_diff else
+                f"模板 {old_tmpl.version}→{new_tmpl.version} 差异 {diff.diff_field_count} 个字段"
+            ),
+            "修正方案": (
+                "新旧版本抽取表达式一致，无需重解析" if zero_diff else
+                ("按位点范围重解析" if observed else "没有批次命中旧版本，无需重解析")
+            ),
+            "零差异": "是" if zero_diff else "否",
+            "差异字段数": str(diff.diff_field_count if diff else 0),
+            "可执行重解析": "否" if zero_diff else "是",
+            "拒绝原因": (
+                "新旧版本抽取表达式逐字段一致，没有实际字段差异，不授权处理历史批次"
+                if zero_diff else ""
+            ),
             "登记时间": transition_time,
         }, status="已收敛" if (diff and diff.converged) else "偏离超限",
             pending=not (diff and diff.converged),
@@ -399,37 +423,67 @@ class ParsePipelineOrchestrator:
                   f"{diff.diff_field_count if diff else 0} fields differ, "
                   f"converged={diff.converged if diff else None}")
 
-        if not affected:
+        if zero_diff:
+            service = SERVICES["tmpl_diff"]
+            service.validate_reparse_range(
+                diff_no, [], {}, register_time=transition_time)
+            return {"link": link, "ok": True, "stage": "tmpl_diff",
+                    "message": "两版抽取表达式逐字段一致，零差异只保留比较结论，不授权重解析",
+                    "hit_versions": hit_versions, "affected": [],
+                    "diff": diff.to_dict() if diff else None,
+                    "range": None,
+                    "receipt": service.get_diff(diff_no).get("范围校验回执")}
+
+        if not observed:
             return {"link": link, "ok": True, "stage": "tmpl_diff",
                     "message": "过渡期内所有批次都命中新版本，无需重解析",
-                    "hit_versions": hit_versions, "affected": []}
+                    "hit_versions": hit_versions, "affected": [],
+                    "diff": diff.to_dict() if diff else None}
 
-        affected_positions = {b: batch_positions[b] for b in affected
+        affected_positions = {b: batch_positions[b] for b in observed
                               if b in batch_positions}
         planned, plan_msg, rng = self.templates.plan_reparse_range(
             reparse_task_id, diff, affected_positions)
         self._log(link, "reparse_range", plan_msg)
+        receipt: dict[str, Any] | None = None
         if planned and rng:
+            service = SERVICES["tmpl_diff"]
+            validated, receipt_msg, receipt = service.validate_reparse_range(
+                diff_no, list(rng.affected_batches), affected_positions,
+                hit_versions=hit_versions, register_time=transition_time)
+            if not validated:
+                self._log(link, "range_receipt", receipt_msg)
+                return {"link": link, "ok": False, "stage": "reparse_range",
+                        "message": receipt_msg, "hit_versions": hit_versions,
+                        "affected": observed,
+                        "diff": diff.to_dict() if diff else None,
+                        "receipt": receipt}
+            self._log(link, "range_receipt", receipt_msg)
             created, cmsg, _task = self.watermark.create_reparse(
-                reparse_task_id, affected[0], f"模板 {old_tmpl.version}→{new_tmpl.version} 差异重解析",
+                reparse_task_id, observed[0], f"模板 {old_tmpl.version}→{new_tmpl.version} 差异重解析",
                 coverage_strategy, rng.start_position, rng.end_position,
                 len(rng.affected_batches))
             _append_row("reparse_task", {
-                "重解析编号": reparse_task_id, "关联批次": affected[0],
+                "重解析编号": reparse_task_id, "关联批次": observed[0],
                 "重解析原因": f"模板{old_tmpl.version}→{new_tmpl.version}差异{diff.diff_field_count}字段",
                 "覆盖策略": coverage_strategy,
                 "起始位点": rng.start_position, "截止位点": rng.end_position,
                 "受影响投递数": str(len(rng.affected_batches)),
+                "受影响批次": ",".join(rng.affected_batches),
+                "差异编号": diff_no,
+                "范围校验回执": receipt,
                 "重解析结论": "",
             }, status="待执行", pending=True)
+            service.record_reparse_task(diff_no, reparse_task_id)
             self._log(link, "reparse_create", cmsg)
         return {"link": link, "ok": planned,
                 "stage": "reparse_range",
                 "message": plan_msg,
                 "hit_versions": hit_versions,
-                "affected": affected,
+                "affected": observed,
                 "diff": diff.to_dict() if diff else None,
-                "range": rng.to_dict() if rng else None}
+                "range": rng.to_dict() if rng else None,
+                "receipt": receipt}
 
     # ------------------------------------------------------------------
     # 链路6：重复指纹→命中重复→结果投递阻断

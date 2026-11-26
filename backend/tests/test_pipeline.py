@@ -2507,3 +2507,208 @@ class TestIntakeAuditAndServices:
         assert audits[-1]["变更后值"] == "探测格式xlsx"
         snap = audit_svc.domain_snapshot()
         assert snap["count"] >= 6
+
+
+# ======================================================================
+# 零差异 / 范围校验回执 / 按批次回查 / 并发确认
+# ======================================================================
+
+def _register_007_templates() -> dict[str, str]:
+    """在抽取模板中登记 007 版本链 v1→v2→v3→v4，供模板差异与重解析消费。"""
+    base = len(store.rows("extract_tmpl"))
+    for offset, (version, count, parent) in enumerate(
+            [("v1", 2, ""), ("v2", 3, "v1"), ("v3", 4, "v2"), ("v4", 5, "v3")]):
+        store.rows("extract_tmpl").append({
+            "id": 900 + base + offset, "status": "过渡中", "pending": False,
+            "abnormal": False, "模板编号": f"ET-007-{version}",
+            "模板名称": "csv-007-fields", "适用格式": "csv", "版本号": version,
+            "抽取表达式数": str(count), "父版本号": parent,
+            "生效时间": "2026-09-01T00:00:00", "最近命中": ""})
+    return {version: f"ET-007-{version}" for version in ("v1", "v2", "v3", "v4")}
+
+
+class TestZeroDiffReceiptAndEligibility:
+    def test_zero_diff_gets_rejection_receipt_not_execution(self, fresh_store):
+        svc = SERVICES["tmpl_diff"]
+        _register_007_templates()
+        ok, _msg, record = svc.compare_versions(
+            "TD-v1-v2", "v1", "v2", ["a", "b"], ["a", "b"], [], 2,
+            "2026-09-10T00:00:00", affected_batch_list=["007"])
+        assert ok is True
+        assert record["零差异"] == "是"
+        assert record["影响批次数"] == "0"
+        assert record["可执行重解析"] == "否"
+        receipt = record["范围校验回执"]
+        assert receipt["结论"] == "拒绝"
+        assert "不授权处理历史批次" in receipt["原因"]
+        assert receipt["验证批次"] == []
+
+    def test_zero_diff_cannot_get_validated_range_or_task(self, fresh_store):
+        diffs = SERVICES["tmpl_diff"]
+        tasks = SERVICES["reparse_task"]
+        _register_007_templates()
+        diffs.compare_versions(
+            "TD-v1-v2", "v1", "v2", ["a", "b"], ["a", "b"], [], 1,
+            "t", affected_batch_list=["007"])
+        passed, _msg, receipt = diffs.validate_reparse_range(
+            "TD-v1-v2", ["007"], {"007": "2026-09-01"}, register_time="t")
+        assert passed is False
+        assert receipt["结论"] == "拒绝"
+        ok, _msg, task = tasks.plan_position_range(
+            "RT-ZERO", "零差异", "旧投递保留", ["007"], {"007": "2026-09-01"},
+            diff_no="TD-v1-v2")
+        assert ok is False
+        assert task is None
+
+    def test_zero_diff_row_offers_no_confirm_action(self, fresh_store):
+        svc = SERVICES["tmpl_diff"]
+        _register_007_templates()
+        svc.compare_versions(
+            "TD-v1-v2", "v1", "v2", ["a"], ["a"], [], 0, "t",
+            affected_batch_list=[])
+        row = svc.get_diff("TD-v1-v2")
+        actions = svc.decorate(row)["可执行动作"]
+        assert "确认收敛" not in actions
+        entry, message = svc.run_action(row["id"], "确认收敛")
+        assert entry is None
+        assert "零差异" in message
+
+    def test_real_change_gets_passing_receipt_and_task(self, fresh_store):
+        diffs = SERVICES["tmpl_diff"]
+        tasks = SERVICES["reparse_task"]
+        _register_007_templates()
+        diffs.compare_versions(
+            "TD-v2-v3", "v2", "v3", ["a", "b"], ["a", "b", "c"], [], 1,
+            "t1", affected_batch_list=["007"])
+        ok, msg, task = tasks.plan_position_range(
+            "RT-23", "模板 v2→v3", "旧投递保留", ["007"],
+            {"007": "2026-09-01"}, diff_no="TD-v2-v3")
+        assert ok is True
+        assert task["范围校验回执"]["结论"] == "通过"
+        assert task["范围校验回执"]["验证批次"] == ["007"]
+        assert task["起始位点"] == "2026-09-01"
+
+    def test_completion_syncs_result_back_to_diff_ledger(self, fresh_store):
+        diffs = SERVICES["tmpl_diff"]
+        tasks = SERVICES["reparse_task"]
+        _register_007_templates()
+        diffs.compare_versions(
+            "TD-v2-v3", "v2", "v3", ["a", "b"], ["a", "b", "c"], [], 1,
+            "t1", affected_batch_list=["007"])
+        tasks.plan_position_range(
+            "RT-23", "模板 v2→v3", "旧投递保留", ["007"],
+            {"007": "2026-09-01"}, diff_no="TD-v2-v3")
+        tasks.start_task("RT-23")
+        ok, _msg, task = tasks.complete_task("RT-23", 1, "重解析完成")
+        assert ok is True
+        ledger = diffs.get_diff("TD-v2-v3")
+        assert ledger["已执行批次"] == "007"
+        assert ledger["执行回执"]["重解析编号"] == "RT-23"
+        eligibility = diffs.resolve_eligibility("TD-v2-v3")
+        assert eligibility["可执行"] is False
+        assert eligibility["已确认产物可打开"] is True
+
+    def test_task_without_diff_cannot_execute_when_linked(self, fresh_store):
+        tasks = SERVICES["reparse_task"]
+        # 无差异编号的旧单保持兼容；带差异编号却没有回执的单不得执行
+        rows = store.rows("reparse_task")
+        rows.append({
+            "id": 990, "status": "待执行", "pending": True, "abnormal": False,
+            "重解析编号": "RT-NORCPT", "关联批次": "PB-001", "重解析原因": "r",
+            "覆盖策略": "旧投递保留", "起始位点": "a", "截止位点": "b",
+            "受影响投递数": "1", "受影响批次": "FI-20260901001",
+            "差异编号": "TD-MISSING", "重解析结论": ""})
+        ok, msg = tasks.start_task("RT-NORCPT")
+        assert ok is False
+        assert "范围校验回执" in msg
+
+
+class TestBatchApplicationLookup:
+    def test_lookup_reports_which_application_can_still_run(self, fresh_store):
+        diffs = SERVICES["tmpl_diff"]
+        tasks = SERVICES["reparse_task"]
+        _register_007_templates()
+        diffs.compare_versions(
+            "TD-v1-v2", "v1", "v2", ["a"], ["a"], [], 1, "t0",
+            affected_batch_list=["007"])
+        diffs.compare_versions(
+            "TD-v2-v3", "v2", "v3", ["a"], ["a", "b"], [], 1, "t1",
+            affected_batch_list=["007"])
+        diffs.compare_versions(
+            "TD-v3-v4", "v3", "v4", ["a", "b"], ["a", "b", "c"], [], 1, "t2",
+            affected_batch_list=["007"])
+        tasks.plan_position_range(
+            "RT-23", "r", "旧投递保留", ["007"], {"007": "p"}, diff_no="TD-v2-v3")
+        apps = {a["差异编号"]: a for a in diffs.applications_for_batch("007")}
+        assert apps["TD-v1-v2"]["可执行"] is False
+        assert apps["TD-v2-v3"]["可执行"] is False
+        assert apps["TD-v2-v3"]["重解析任务编号"] == "RT-23"
+        assert apps["TD-v3-v4"]["可执行"] is True
+
+    def test_detailed_zero_diff_conclusion_stays_open(self, fresh_store):
+        diffs = SERVICES["tmpl_diff"]
+        _register_007_templates()
+        diffs.compare_versions(
+            "TD-v1-v2", "v1", "v2", ["a"], ["a"], [], 0, "t",
+            affected_batch_list=[])
+        row = diffs.get_diff("TD-v1-v2")
+        detail = diffs.detail(row["id"])
+        eligibility = detail["extra"]["资格结论"]
+        assert eligibility["比较详情可打开"] is True
+        assert "零变化" in eligibility["零变化结论"]
+        assert "不授权处理历史批次" in eligibility["拒绝原因"]
+
+
+class TestConcurrentSubmission:
+    def test_same_pair_only_confirmed_once(self, fresh_store):
+        diffs = SERVICES["tmpl_diff"]
+        tasks = SERVICES["reparse_task"]
+        _register_007_templates()
+        diffs.compare_versions(
+            "TD-v2-v3", "v2", "v3", ["a"], ["a", "b"], [], 1, "t",
+            affected_batch_list=["007"])
+        first, _msg, _task = tasks.plan_position_range(
+            "RT-A", "r", "旧投递保留", ["007"], {"007": "p"}, diff_no="TD-v2-v3")
+        second, msg, task = tasks.plan_position_range(
+            "RT-B", "r", "旧投递保留", ["007"], {"007": "p"}, diff_no="TD-v2-v3")
+        assert first is True
+        assert second is False
+        assert task is None
+        assert "RT-A" in msg
+
+    def test_zero_diff_old_task_gets_no_execution_receipt(self, fresh_store):
+        diffs = SERVICES["tmpl_diff"]
+        tasks = SERVICES["reparse_task"]
+        _register_007_templates()
+        diffs.compare_versions(
+            "TD-v1-v2", "v1", "v2", ["a"], ["a"], [], 0, "t",
+            affected_batch_list=[])
+        rows = store.rows("reparse_task")
+        rows.append({
+            "id": 991, "status": "待执行", "pending": True, "abnormal": False,
+            "重解析编号": "RT-OLD-ZERO", "关联批次": "007", "重解析原因": "旧零差异",
+            "覆盖策略": "旧投递保留", "起始位点": "a", "截止位点": "b",
+            "受影响投递数": "1", "受影响批次": "007",
+            "差异编号": "TD-v1-v2", "重解析结论": ""})
+        ok, _msg, task = tasks.complete_task("RT-OLD-ZERO", 1, "重放")
+        assert ok is False
+        assert task.get("执行回执") is None
+
+    def test_confirmed_delivery_still_readable_after_replace(self, fresh_store):
+        tasks = SERVICES["reparse_task"]
+        _register_007_templates()
+        diffs = SERVICES["tmpl_diff"]
+        diffs.compare_versions(
+            "TD-v2-v3", "v2", "v3", ["a"], ["a", "c"], [], 1, "t",
+            affected_batch_list=["FI-20260901001"])
+        tasks.plan_position_range(
+            "RT-REPL", "r", "被新记录替代", ["FI-20260901001"],
+            {"FI-20260901001": "2026-09-01"}, diff_no="TD-v2-v3")
+        ok, _msg, task = tasks.complete_task("RT-REPL", 1, "重解析完成")
+        assert ok is True
+        assert task["执行回执"]["已发布"] is True
+        rd1 = next(r for r in store.rows("result_deliver")
+                   if r["投递记录编号"] == "RD-001")
+        # 原送达内容被替代后仍保留可核对的原值
+        assert rd1["status"] == "已作废"
+        assert rd1["投递结论"].startswith("被 RT-REPL")

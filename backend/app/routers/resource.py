@@ -73,6 +73,18 @@ def export_entries(
     )
 
 
+@router.get("/{module}/eligibility", response_model=dict)
+def batch_eligibility(module: str, batch: str = Query(default="")) -> dict[str, Any]:
+    """按批次回查差异申请：哪份仍可执行、哪份已被另一版本占用。
+
+    固定路径必须先于 /{module}/{entry_id} 注册，否则会被动态整数路径抢先匹配。
+    """
+    service = require_service(module)
+    if not hasattr(service, "applications_for_batch"):
+        raise HTTPException(status_code=404, detail=f"{module} 不支持按批次回查申请")
+    return {"batch": batch, "applications": service.applications_for_batch(batch)}
+
+
 @router.get("/{module}/{entry_id}", response_model=dict)
 def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     service = require_service(module)
@@ -80,6 +92,18 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     if entry is None:
         raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
     return entry
+
+
+@router.get("/{module}/{entry_id}/detail", response_model=dict)
+def get_detail(module: str, entry_id: int, batch: str | None = Query(default=None)) -> dict[str, Any]:
+    """比较详情/任务详情：条目本体 + 可执行资格、回执与可打开产物。"""
+    service = require_service(module)
+    detail = service.detail(entry_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
+    if batch and hasattr(service, "applications_for_batch"):
+        detail["extra"]["同批申请"] = service.applications_for_batch(batch)
+    return detail
 
 
 @router.post("/{module}", response_model=ActionResult)

@@ -1,6 +1,13 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  BatchEligibility,
+  EntryDetail,
+  EntryRow,
+  OverviewResult,
+  PageResult,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -57,5 +64,27 @@ export async function downloadEntries(
 export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')
+  return await response.json()
+}
+
+export async function loadEntryDetail(
+  key: string,
+  id: number,
+  batch = '',
+): Promise<EntryDetail> {
+  const query = batch ? `?batch=${encodeURIComponent(batch)}` : ''
+  const response = await request(`/api/${key}/${id}/detail${query}`)
+  if (!response.ok) throw new Error('比较详情读取失败')
+  return await response.json()
+}
+
+export async function loadBatchEligibility(
+  key: string,
+  batch: string,
+): Promise<BatchEligibility> {
+  const response = await request(
+    `/api/${key}/eligibility?batch=${encodeURIComponent(batch)}`,
+  )
+  if (!response.ok) throw new Error('按批次回查申请失败')
   return await response.json()
 }
